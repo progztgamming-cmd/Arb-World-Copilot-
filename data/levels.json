@@ -1,0 +1,146 @@
+import discord
+from discord.ext import commands
+import json
+import asyncio
+import time
+from datetime import datetime, timezone
+
+class Leveling(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.data_file = "data/levels.json"
+        self.data = {}
+        self.cooldowns = {}  # user_id: timestamp
+        self.load_data()
+
+    def load_data(self):
+        try:
+            with open(self.data_file, "r", encoding="utf-8") as f:
+                self.data = json.load(f)
+        except FileNotFoundError:
+            self.data = {}
+
+    def save_data(self):
+        with open(self.data_file, "w", encoding="utf-8") as f:
+            json.dump(self.data, f, indent=4, ensure_ascii=False)
+
+    def get_xp_for_level(self, level):
+        """دالة حساب الخبرة المطلوبة للمستوى (زيادة تدريجية)"""
+        return 5 * (level ** 2) + 50 * level + 100
+
+    def get_level_from_xp(self, xp):
+        level = 1
+        while xp >= self.get_xp_for_level(level):
+            xp -= self.get_xp_for_level(level)
+            level += 1
+        return level
+
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        if message.author.bot:
+            return
+        if not message.guild:
+            return
+
+        user_id = str(message.author.id)
+
+        # منح رتبة Active Member إذا لم تكن موجودة
+        active_role = discord.utils.get(message.guild.roles, name="Active Member")
+        if active_role and active_role not in message.author.roles:
+            try:
+                await message.author.add_roles(active_role, reason="تفاعل يومي")
+            except discord.Forbidden:
+                pass
+
+        # تجنب إعطاء XP بسرعة كبيرة (cooldown دقيقة)
+        now = time.time()
+        if user_id in self.cooldowns and now - self.cooldowns[user_id] < 60:
+            return
+        self.cooldowns[user_id] = now
+
+        # إعطاء XP عشوائي بين 15 و 25 نقطة
+        xp_gain = __import__("random").randint(15, 25)
+
+        # تحميل بيانات المستخدم
+        if user_id not in self.data:
+            self.data[user_id] = {"xp": 0, "level": 1}
+        old_level = self.data[user_id]["level"]
+        self.data[user_id]["xp"] += xp_gain
+        new_level = self.get_level_from_xp(self.data[user_id]["xp"])
+
+        # تصحيح المستوى إذا حدث قفزة
+        if new_level > 20:
+            new_level = 20
+        self.data[user_id]["level"] = new_level
+
+        self.save_data()
+
+        # تحقق من الترقية
+        if new_level > old_level:
+            # إرسال DM للعضو
+            try:
+                embed = discord.Embed(
+                    title="🎉 مبروك الترقية!",
+                    description=f"لقد وصلت إلى المستوى **{new_level}**!",
+                    color=discord.Color.green(),
+                    timestamp=datetime.now(timezone.utc)
+                )
+                embed.add_field(name="الخبرة الحالية", value=f"{self.data[user_id]['xp']} XP")
+                embed.set_footer(text="Arb World Copilot")
+                await message.author.send(embed=embed)
+            except discord.Forbidden:
+                pass
+
+            # منح الرتب المناسبة حسب المستوى
+            guild = message.guild
+            level_roles = {
+                10: "Level 10",
+                15: "Level 25",
+                20: "Level 50"
+            }
+            if new_level in level_roles:
+                role_name = level_roles[new_level]
+                role = discord.utils.get(guild.roles, name=role_name)
+                if role:
+                    try:
+                        await message.author.add_roles(role, reason=f"وصل المستوى {new_level}")
+                    except discord.Forbidden:
+                        pass
+
+            # إزالة الرتب الأدنى إذا لزم الأمر (اختياري)
+            # مثلاً عند المستوى 15، إزالة "Level 10"
+            if new_level == 15:
+                old_role = discord.utils.get(guild.roles, name="Level 10")
+                if old_role and old_role in message.author.roles:
+                    try:
+                        await message.author.remove_roles(old_role, reason="ترقية إلى Level 25")
+                    except:
+                        pass
+            elif new_level == 20:
+                old_role = discord.utils.get(guild.roles, name="Level 25")
+                if old_role and old_role in message.author.roles:
+                    try:
+                        await message.author.remove_roles(old_role, reason="ترقية إلى Level 50")
+                    except:
+                        pass
+
+    @commands.command(name="rank")
+    async def rank(self, ctx, member: discord.Member = None):
+        """عرض مستوى العضو ونقاط الخبرة"""
+        member = member or ctx.author
+        user_id = str(member.id)
+        if user_id not in self.data:
+            await ctx.send(f"{member.display_name} لم يكتسب أي خبرة بعد.")
+            return
+        xp = self.data[user_id]["xp"]
+        level = self.data[user_id]["level"]
+        embed = discord.Embed(
+            title=f"مستوى {member.display_name}",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="المستوى", value=level)
+        embed.add_field(name="الخبرة", value=f"{xp} XP")
+        await ctx.send(embed=embed)
+
+async def setup(bot):
+    await bot.add_cog(Leveling(bot))
