@@ -1,0 +1,247 @@
+import discord
+from discord.ext import commands
+import asyncio
+from datetime import datetime, timedelta, timezone
+import re
+
+from services.groq_service import get_groq_response
+from services.knowledge_base import get_knowledge_text
+from services.forms import build_complaint_embed, build_suggestion_embed, build_bug_report_embed
+from services.validator import validate_complaint, validate_suggestion, validate_bug_report
+from services.log_sender import send_log
+
+ASK_CHANNEL_ID = 1528325597363961946
+LOGS_CHANNEL_ID = 1534182485502464071
+FIRST_MESSAGE_CONTENT = "مرحبًا بك في ركن المساعدة! يمكنك سؤالي عن أي شيء يخص السيرفر، أو تقديم شكوى، أو اقتراح، أو الإبلاغ عن خطأ. أنا هنا لخدمتك."
+
+BAD_WORDS = ["كس", "زب", "منيوك", "عرص", "شرموط", "خول", "كلب", "حمار", "fuck", "shit", "bitch"]
+
+class AskArbWorld(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.user_states = {}  # user_id -> {"state": str, "data": dict}
+        self.last_activity = datetime.now(timezone.utc)
+        self.first_message_id = None
+        self.clean_task = self.bot.loop.create_task(self.channel_cleaner())
+
+    def cog_unload(self):
+        self.clean_task.cancel()
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        await self.bot.wait_until_ready()
+        channel = self.bot.get_channel(ASK_CHANNEL_ID)
+        if channel is None:
+            return
+        # Pin the first explanatory message if not already present
+        pins = await channel.pins()
+        if not pins:
+            msg = await channel.send(FIRST_MESSAGE_CONTENT)
+            await msg.pin()
+            self.first_message_id = msg.id
+        else:
+            self.first_message_id = pins[0].id
+
+    async def channel_cleaner(self):
+        await self.bot.wait_until_ready()
+        while not self.bot.is_closed():
+            await asyncio.sleep(60)
+            channel = self.bot.get_channel(ASK_CHANNEL_ID)
+            if channel is None:
+                continue
+            # Check if any non-bot member is present
+            members = [m for m in channel.members if not m.bot]
+            if not members:
+                # Check if last non-bot message is older than 3 minutes
+                three_min_ago = datetime.now(timezone.utc) - timedelta(minutes=3)
+                oldest_allowed = three_min_ago
+                # Find last message by a human
+                async for message in channel.history(limit=50):
+                    if not message.author.bot and message.id != self.first_message_id:
+                        oldest_allowed = message.created_at
+                        break
+                if oldest_allowed < three_min_ago:
+                    # Delete all messages except the pinned first message
+                    await channel.purge(check=lambda m: m.id != self.first_message_id, bulk=True)
+
+    def detect_language(self, text):
+        # Simple detection: if any Arabic character, assume Arabic, else English
+        if re.search(r'[\u0600-\u06FF]', text):
+            return "ar"
+        return "en"
+
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        if message.author.bot:
+            return
+        if message.channel.id != ASK_CHANNEL_ID:
+            return
+
+        # Update last activity time
+        self.last_activity = datetime.now(timezone.utc)
+
+        # Bad word filter
+        content_lower = message.content.lower()
+        if any(bad in content_lower for bad in BAD_WORDS):
+            await message.delete()
+            warn_msg = await message.channel.send(f"{message.author.mention} ⚠️ ممنوع استخدام الألفاظ النابية! تحذير شديد.")
+            await asyncio.sleep(5)
+            await warn_msg.delete()
+            return
+
+        # Conversation state handling
+        user_id = message.author.id
+        if user_id in self.user_states:
+            await self.handle_state(message)
+            return
+
+        # Check if user wants to start a form
+        if self.intent_to_form(message.content):
+            await self.start_form(message)
+            return
+
+        # Default: AI question
+        await self.handle_ai_question(message)
+
+    def intent_to_form(self, text):
+        text_lower = text.lower()
+        complaint_kw = ["شكوى", "شكوي", "complain", "complaint"]
+        suggestion_kw = ["اقتراح", "suggest", "suggestion"]
+        bug_kw = ["bug", "خطأ", "error", "مشكلة", "ابلاغ عن خطأ", "بلاغ"]
+        if any(kw in text_lower for kw in complaint_kw):
+            return "complaint"
+        if any(kw in text_lower for kw in suggestion_kw):
+            return "suggestion"
+        if any(kw in text_lower for kw in bug_kw):
+            return "bug"
+        return None
+
+    async def start_form(self, message):
+        form_type = self.intent_to_form(message.content)
+        if form_type == "complaint":
+            self.user_states[message.author.id] = {"state": "complaint_name", "data": {}}
+            await message.channel.send(f"{message.author.mention} من فضلك، اكتب اسم الشخص المشكو عليه (إجباري).")
+        elif form_type == "suggestion":
+            self.user_states[message.author.id] = {"state": "suggestion_name_age", "data": {}}
+            await message.channel.send(f"{message.author.mention} من فضلك، اكتب اسمك وعمرك (إجباري).")
+        elif form_type == "bug":
+            self.user_states[message.author.id] = {"state": "bug_name", "data": {}}
+            await message.channel.send(f"{message.author.mention} ما اسمك؟ (إجباري)")
+
+    async def handle_state(self, message):
+        user_id = message.author.id
+        state = self.user_states[user_id]["state"]
+        data = self.user_states[user_id]["data"]
+        content = message.content.strip()
+
+        if content.lower() in ["cancel", "الغاء", "إلغاء"]:
+            del self.user_states[user_id]
+            await message.channel.send(f"{message.author.mention} تم إلغاء العملية.")
+            return
+
+        # Complaint flow
+        if state == "complaint_name":
+            data["against"] = content
+            self.user_states[user_id]["state"] = "complaint_time"
+            await message.channel.send(f"{message.author.mention} متى حدثت المشكلة؟ (إجباري)")
+        elif state == "complaint_time":
+            data["time"] = content
+            self.user_states[user_id]["state"] = "complaint_location"
+            await message.channel.send(f"{message.author.mention} أين حدثت المشكلة؟ (إجباري)")
+        elif state == "complaint_location":
+            data["location"] = content
+            self.user_states[user_id]["state"] = "complaint_content"
+            await message.channel.send(f"{message.author.mention} اشرح محتوى الشكوى (إجباري)")
+        elif state == "complaint_content":
+            data["content"] = content
+            self.user_states[user_id]["state"] = "complaint_screenshot"
+            await message.channel.send(f"{message.author.mention} هل لديك سكرين شوت؟ يمكنك إرفاقه الآن أو كتابة 'لا'. (اختياري)")
+        elif state == "complaint_screenshot":
+            if message.attachments:
+                data["screenshot"] = message.attachments[0].url
+            else:
+                data["screenshot"] = content if content.lower() != "لا" else "None"
+            # Validation & send
+            try:
+                validate_complaint(data)
+                embed = build_complaint_embed(message.author, data)
+                logs_channel = self.bot.get_channel(LOGS_CHANNEL_ID)
+                if logs_channel:
+                    await send_log(logs_channel, embed)
+                await message.channel.send(f"{message.author.mention} تم استلام شكواك بنجاح، ستراجعها الإدارة قريبًا. إذا لم يصلك رد، يمكنك فتح تذكرة.")
+            except Exception as e:
+                await message.channel.send(f"{message.author.mention} حدث خطأ أثناء التحقق من البيانات، حاول مرة أخرى.")
+            finally:
+                del self.user_states[user_id]
+
+        # Suggestion flow
+        elif state == "suggestion_name_age":
+            data["name_age"] = content
+            self.user_states[user_id]["state"] = "suggestion_content"
+            await message.channel.send(f"{message.author.mention} اكتب محتوى الاقتراح (إجباري)")
+        elif state == "suggestion_content":
+            data["content"] = content
+            try:
+                validate_suggestion(data)
+                embed = build_suggestion_embed(message.author, data)
+                logs_channel = self.bot.get_channel(LOGS_CHANNEL_ID)
+                if logs_channel:
+                    await send_log(logs_channel, embed)
+                await message.channel.send(f"{message.author.mention} تم استلام اقتراحك، شكرًا لمساهمتك!")
+            except Exception as e:
+                await message.channel.send(f"{message.author.mention} بيانات الاقتراح غير صحيحة، حاول مجددًا.")
+            finally:
+                del self.user_states[user_id]
+
+        # Bug report flow
+        elif state == "bug_name":
+            data["name"] = content
+            self.user_states[user_id]["state"] = "bug_location"
+            await message.channel.send(f"{message.author.mention} أين وجدت الخطأ؟ (إجباري)")
+        elif state == "bug_location":
+            data["location"] = content
+            self.user_states[user_id]["state"] = "bug_reproduce"
+            await message.channel.send(f"{message.author.mention} كيف يمكننا تكرار الخطأ؟ (إجباري)")
+        elif state == "bug_reproduce":
+            data["reproduce"] = content
+            self.user_states[user_id]["state"] = "bug_screenshot"
+            await message.channel.send(f"{message.author.mention} أرفق سكرين شوت للخطأ (إجباري).")
+        elif state == "bug_screenshot":
+            if message.attachments:
+                data["screenshot"] = message.attachments[0].url
+            else:
+                await message.channel.send(f"{message.author.mention} السكرين شوت مطلوب، أرفقه من فضلك.")
+                return
+            try:
+                validate_bug_report(data)
+                embed = build_bug_report_embed(message.author, data)
+                logs_channel = self.bot.get_channel(LOGS_CHANNEL_ID)
+                if logs_channel:
+                    await send_log(logs_channel, embed)
+                await message.channel.send(f"{message.author.mention} تم إرسال بلاغ الخطأ بنجاح. شكرًا لتنبيهنا!")
+            except Exception as e:
+                await message.channel.send(f"{message.author.mention} فشل التحقق من البلاغ. تأكد من البيانات.")
+            finally:
+                del self.user_states[user_id]
+
+    async def handle_ai_question(self, message):
+        async with message.channel.typing():
+            knowledge = get_knowledge_text()
+            lang = self.detect_language(message.content)
+            prompt = f"""You are a helpful assistant for the Arb World Discord server. 
+Answer the user's question naturally and warmly, mention them by name or just use their mention.
+Respond in the same language as the user's message (Arabic or English).
+Use the provided knowledge base to answer accurately. If unsure, say you don't know.
+
+Knowledge:
+{knowledge}
+
+User question: {message.content}"""
+            try:
+                response = get_groq_response(prompt)
+                await message.channel.send(f"{message.author.mention} {response}")
+            except Exception as e:
+                await message.channel.send(f"{message.author.mention} عذرًا، حدث خطأ أثناء معالجة سؤالك. حاول مرة أخرى لاحقًا.")
+
+async def setup(bot):
+    await bot.add_cog(AskArbWorld(bot))
