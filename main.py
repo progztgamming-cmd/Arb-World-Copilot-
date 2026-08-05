@@ -1,58 +1,45 @@
 import discord
-import requests
-from flask import Flask
-from threading import Thread
+from discord.ext import commands
+import os
+import asyncio
 
-app = Flask('')
+# جلب التوكن والمفتاح من config.py أو من متغيرات البيئة
+try:
+    from config import DISCORD_TOKEN, GROQ_API_KEY
+except ImportError:
+    DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
+    GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 
-@app.route('/')
-def home():
-    return "Online"
+# تعريف البوت مع كل الصلاحيات
+intents = discord.Intents.all()
+bot = commands.Bot(command_prefix='!', intents=intents)
 
-def run():
-    app.run(host='0.0.0.0', port=10000)
+# قائمة الكوجات التي سنقوم بتحميلها
+cogs_list = [
+    'cogs.ask_arb_world',
+    'cogs.moderation',
+    'cogs.leveling',
+    'cogs.welcome',
+    'cogs.voice'
+]
 
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
-
-TEAM_ID = "d028d085fede4dbfda383cab901ce18105d6f1ec1e975d667fce7eb03dc4bbcd"
-BOT_ID = "nYuFXohNxsLfgbet0XqG"
-
-DOCSBOT_URL = f"https://api.docsbot.ai/v1/teams/{TEAM_ID}/bots/{BOT_ID}/ask"
-
-intents = discord.Intents.default()
-intents.message_content = True
-client = discord.Client(intents=intents)
-
-@client.event
+@bot.event
 async def on_ready():
-    print("Ready")
-    await client.change_presence(activity=discord.Game(name="ARB WORLD Copilot"))
+    print(f'✅ تم تشغيل البوت {bot.user} بنجاح')
+    await bot.change_presence(activity=discord.Game(name="Arb World Copilot"))
 
-@client.event
-async def on_message(message):
-    if message.author == client.user:
-        return
+async def load_cogs():
+    for cog in cogs_list:
+        try:
+            await bot.load_extension(cog)
+            print(f'🔹 Loaded {cog}')
+        except Exception as e:
+            print(f'❌ Failed to load {cog}: {e}')
 
-    if client.user.mentioned_in(message) or message.channel.name == "ask_arb_copilot":
-        async with message.channel.typing():
-            clean_text = message.content.replace(f'<@{client.user.id}>', '').strip()
-            
-            if not clean_text:
-                await message.reply("Yes sir, I am listening. How can I help you?")
-                return
+async def main():
+    async with bot:
+        await load_cogs()
+        await bot.start(DISCORD_TOKEN)
 
-            try:
-                response = requests.post(DOCSBOT_URL, json={"question": clean_text})
-                if response.status_code == 200:
-                    answer = response.json().get("answer", "No answer found in documents.")
-                    await message.reply(answer)
-                else:
-                    await message.reply("Error: Connection issue with DocsBot.")
-            except Exception as e:
-                await message.reply("Error: Failed to process request.")
-
-keep_alive()
-client.run(TOKEN)
-              
+if __name__ == '__main__':
+    asyncio.run(main())
