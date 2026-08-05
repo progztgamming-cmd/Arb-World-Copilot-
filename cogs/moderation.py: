@@ -1,0 +1,135 @@
+import discord
+from discord.ext import commands
+import asyncio
+import re
+from datetime import datetime, timezone, timedelta
+from collections import defaultdict
+
+import services.log_sender as log_sender
+
+# القنوات المستثناة من الرقابة
+EXEMPT_CHANNELS = [1527338458668990514, 1484892482914357381]  # crew_chat, bots_commands
+LOGS_CHANNEL_ID = 1534182485502464071
+
+# قوائم الكلمات المحظورة (سب + تنمر)
+BAD_WORDS = [
+    "كس", "زب", "منيوك", "عرص", "شرموط", "خول", "كلب", "حمار",
+    "fuck", "shit", "bitch", "asshole", "retard", "idiot", "loser",
+    "غبي", "حقير", "تافه", "منحط", "حيوان"
+]
+
+# روابط شائعة للمنع (يمكن إضافة نطاقات)
+LINK_PATTERN = r"(https?://\S+|discord\.gg/\S+|www\.\S+)"
+
+# نظام التكرار (spam)
+SPAM_WINDOW = 3  # ثوانٍ
+user_last_message = defaultdict(lambda: None)
+
+class Moderation(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.warnings = defaultdict(int)  # user_id -> عدد الإنذارات
+
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        if message.author.bot:
+            return
+        if message.channel.id in EXEMPT_CHANNELS:
+            return
+
+        # تحقق من الروابط أولاً (لحذفها فورًا)
+        if re.search(LINK_PATTERN, message.content):
+            await self.handle_violation(message, "رابط", "ممنوع نشر الروابط")
+            return
+
+        # تحقق من الكلمات المحظورة
+        content_lower = message.content.lower()
+        for bad in BAD_WORDS:
+            if bad in content_lower:
+                await self.handle_violation(message, "كلمة محظورة", f"ممنوع استخدام '{bad}'")
+                return
+
+        # تحقق من التكرار (سبام)
+        now = datetime.now(timezone.utc)
+        last_time = user_last_message[message.author.id]
+        if last_time and (now - last_time).total_seconds() < SPAM_WINDOW:
+            await self.handle_violation(message, "سبام", "ممنوع تكرار الرسائل بسرعة")
+            return
+        user_last_message[message.author.id] = now
+
+    async def handle_violation(self, message, violation_type, reason):
+        # حذف الرسالة
+        try:
+            await message.delete()
+        except discord.Forbidden:
+            pass
+
+        # إرسال تحذير في نفس الروم (يختفي بعد 5 ثوانٍ)
+        warn_msg = await message.channel.send(
+            f"{message.author.mention} ⚠️ {reason}",
+            delete_after=5
+        )
+
+        # إرسال تحذير خاص للعضو
+        try:
+            embed = discord.Embed(
+                title="تنبيه مخالفة",
+                description=f"لقد قمت بمخالفة في سيرفر Arb World.\nالنوع: **{violation_type}**\nالسبب: {reason}",
+                color=discord.Color.orange(),
+                timestamp=datetime.now(timezone.utc)
+            )
+            embed.add_field(name="القناة", value=message.channel.mention)
+            await message.author.send(embed=embed)
+        except discord.Forbidden:
+            pass
+
+        # زيادة عداد التحذيرات
+        self.warnings[message.author.id] += 1
+        current_warns = self.warnings[message.author.id]
+
+        # تطبيق عقوبة الميوت عند تجاوز 100 تحذير
+        if current_warns >= 100:
+            try:
+                timeout_duration = timedelta(minutes=5)
+                await message.author.timeout(timeout_duration, reason=f"تجاوز 100 تحذير - {violation_type}")
+                # إعلام الإدارة
+                log_embed = discord.Embed(
+                    title="🚫 ميوت تلقائي",
+                    description=f"{message.author.mention} تم كتمه 5 دقائق",
+                    color=discord.Color.red()
+                )
+                log_embed.add_field(name="السبب", value=f"تجاوز 100 تحذير (آخرها: {violation_type})")
+                log_embed.set_footer(text=f"User ID: {message.author.id}")
+                await self.send_to_logs(log_embed)
+                # إعادة تعيين العداد
+                self.warnings[message.author.id] = 0
+            except discord.Forbidden:
+                pass
+        else:
+            # إرسال تقرير مفصل إلى روم logs
+            log_embed = discord.Embed(
+                title="📋 تقرير مخالفة",
+                description=f"المستخدم: {message.author.mention}",
+                color=discord.Color.orange()
+            )
+            log_embed.add_field(name="النوع", value=violation_type)
+            log_embed.add_field(name="القناة", value=message.channel.mention)
+            log_embed.add_field(name="المحتوى", value=message.content[:1024] if message.content else "محتوى غير نصي", inline=False)
+            log_embed.add_field(name="الإنذار الحالي", value=f"{current_warns}/100")
+            log_embed.set_footer(text=f"User ID: {message.author.id} • {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}")
+            await self.send_to_logs(log_embed)
+
+    async def send_to_logs(self, embed):
+        channel = self.bot.get_channel(LOGS_CHANNEL_ID)
+        if channel:
+            await log_sender.send_log(channel, embed)
+
+    # أمر لضبط الحساسية (اختياري مستقبلاً)
+    @commands.command(name="set_sensitivity")
+    @commands.has_permissions(administrator=True)
+    async def set_sensitivity(self, ctx, level: str):
+        """تحديد مستوى صرامة الفلاتر (غير مفعل بعد)"""
+        await ctx.send("خاصية قيد التطوير.")
+
+async def setup(bot):
+    await bot.add_cog(Moderation(bot))
