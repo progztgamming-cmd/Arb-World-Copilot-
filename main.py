@@ -16,7 +16,6 @@ def keep_alive():
     t = Thread(target=run)
     t.start()
 
-TOKEN = "MTUyODM0OTI4NDY4MzA4Nzg3Mg.GaTyxX.H96V-3N45re-ck_C1IcuGU-2Q609d8OM-1KgSI"
 TEAM_ID = "d028d085fede4dbfda383cab901ce18105d6f1ec1e975d667fce7eb03dc4bbcd"
 BOT_ID = "nYuFXohNxsLfgbet0XqG"
 
